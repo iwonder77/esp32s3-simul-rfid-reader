@@ -1,206 +1,432 @@
 /*
-  Example: Gen2 Parameter Control for Multi-Tag Inventory
-  Based on SparkFun Example31, simplified for ESP32-S3 + M7E Hecto
+  Multi-Tag Simultaneous Read — Corrected Implementation
+  ESP32-S3 + M7E Hecto (using paulvha's library fork)
   
-  Hardware: ESP32-S3 → M7E Hecto via UART
-    - ESP32 RX (GPIO18) → M7E TX
-    - ESP32 TX (GPIO17) → M7E RX
+  Uses CONTINUOUS READING mode with proper Gen2 parameters:
+    - Session S1   → tag flags persist ~500ms-5s, suppressing re-reads
+    - Target AB    → inventory A until exhausted, then B, then repeat
+    - Dynamic Q=2  → starts with 4 slots, auto-adjusts for population
   
-  Key Gen2 Parameters for simultaneous tag detection:
-    - Session (S0-S3): Controls tag state persistence. S1/S2 recommended for multi-tag.
-    - Target (A/B/AB/BA): Controls which tag states respond. AB/BA enables round-robin.
-    - Q: Slot count for anti-collision. Dynamic recommended for varying tag counts.
-    - RFMode: Link frequency, encoding, and timing configuration.
+  Approach:
+    On keyboard press → open a collection window → accumulate unique EPCs
+    via check()/parseResponse() → match against known puck EPCs → light LEDs.
+  
+  This avoids readTagEPC()/readData() which uses an 8-byte command format 
+  that may be incompatible with M7E Hecto (SparkFun's M7E update added 
+  3 required bytes that paulvha's readData() does not include).
+
+  Puck-to-LED Mapping:
+    Yellow LED (GPIO 1)  ← EPC: E2 80 68 94 00 00 40 33 56 39 29 0A
+    Blue   LED (GPIO 2)  ← EPC: E2 80 68 94 00 00 40 33 56 38 ED 0A
+    Green  LED (GPIO 3)  ← EPC: E2 80 68 94 00 00 50 33 56 39 2D 0A
 */
 
-#include "SparkFun_UHF_RFID_Reader.h"
+#include "src/SparkFun_UHF_RFID_Reader.h"
 
-// === Hardware Configuration ===
+// ─── Hardware Configuration ──────────────────────────────────────────────────
+
 #define RXD1 18  // ESP32-S3 RX ← M7E TX
 #define TXD1 17  // ESP32-S3 TX → M7E RX
 #define RFID_BAUD 115200
 #define RFID_REGION REGION_NORTHAMERICA
-#define DEBUG_LEVEL 0  // 0: off, 1: show UART traffic
+
+// ─── LED Pins ───────────────────────────────────────────────────────────────
+
+#define PIN_LED_YELLOW 1
+#define PIN_LED_BLUE 2
+#define PIN_LED_GREEN 3
+
+// ─── Scan Configuration ─────────────────────────────────────────────────────
+
+#define MAX_TAGS 10          // Maximum unique tags to track
+#define EPC_MAX_BYTES 12     // Standard EPC length (96 bits)
+#define SCAN_WINDOW_MS 500   // How long to collect tags after trigger (ms)
+#define READ_POWER 1000      // adjust during testing (ex 1500 = 15.00 dBm)
+#define LED_DISPLAY_MS 3000  // How long LEDs stay lit after a scan
+
+// ─── Known Puck EPCs ────────────────────────────────────────────────────────
+
+#define NUM_PUCKS 3
+#define EPC_LENGTH 12
+
+static const uint8_t PUCK_EPC_YELLOW[EPC_LENGTH] = {
+  0xE2, 0x80, 0x68, 0x94, 0x00, 0x00, 0x40, 0x33, 0x56, 0x39, 0x29, 0x0A
+};
+static const uint8_t PUCK_EPC_BLUE[EPC_LENGTH] = {
+  0xE2, 0x80, 0x68, 0x94, 0x00, 0x00, 0x40, 0x33, 0x56, 0x38, 0xED, 0x0A
+};
+static const uint8_t PUCK_EPC_GREEN[EPC_LENGTH] = {
+  0xE2, 0x80, 0x68, 0x94, 0x00, 0x00, 0x50, 0x33, 0x56, 0x39, 0x2D, 0x0A
+};
+
+struct PuckConfig {
+  const uint8_t *epc;
+  uint8_t ledPin;
+  const char *name;
+  bool detected;
+};
+
+static PuckConfig pucks[NUM_PUCKS] = {
+  { PUCK_EPC_YELLOW, PIN_LED_YELLOW, "Yellow", false },
+  { PUCK_EPC_BLUE, PIN_LED_BLUE, "Blue", false },
+  { PUCK_EPC_GREEN, PIN_LED_GREEN, "Green", false },
+};
+
+// ─── Tag Storage ────────────────────────────────────────────────────────────
+
+struct DetectedTag {
+  byte epc[EPC_MAX_BYTES];
+  uint8_t epcLen;
+  int8_t rssi;
+  uint32_t lastSeenMs;
+};
+
+DetectedTag tagInventory[MAX_TAGS];
+int tagCount = 0;
+bool readerRunning = false;
 
 RFID rfidModule;
 
+// ─── Setup ──────────────────────────────────────────────────────────────────
+
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
-  Serial.println(F("ESP32-S3 + M7E Hecto: Gen2 Parameter Test"));
+  while (!Serial) { delay(10); }
 
-  if (DEBUG_LEVEL) rfidModule.enableDebugging(Serial);
+  Serial.println(F("\n========================================"));
+  Serial.println(F("  Multi-Tag Scan — Continuous Read Mode"));
+  Serial.println(F("========================================\n"));
 
-  // Initialize Serial1 with custom pins
-  Serial1.begin(RFID_BAUD, SERIAL_8N1, RXD1, TXD1);
-  
-  if (!setupRfidModule()) {
-    Serial.println(F("ERROR: Module not responding. Check wiring."));
-    while (1);
+  // Configure LED pins
+  for (int i = 0; i < NUM_PUCKS; i++) {
+    pinMode(pucks[i].ledPin, OUTPUT);
+    digitalWrite(pucks[i].ledPin, LOW);
   }
 
-  rfidModule.setRegion(RFID_REGION);
-  rfidModule.setReadPower(500);  // 5.00 dBm - low power for near-field
+  // Initialize UART to M7E with explicit ESP32-S3 pin mapping
+  Serial1.begin(RFID_BAUD, SERIAL_8N1, RXD1, TXD1);
 
-  // Configure Gen2 for multi-tag inventory
-  setSession(TMR_GEN2_SESSION_S1);        // Persistent tag state (~500ms-5s)
-  setTarget(TMR_GEN2_TARGET_AB);          // Inventory A, then B (round-robin)
-  setRFMode(TMR_GEN2_RFMODE_250_M4_20);   // 250KHz BLF, Miller-4, 20µs Tari
+  if (!initializeModule()) {
+    Serial.println(F("FATAL: RFID module not responding. Check wiring and power."));
+    while (1) { delay(1000); }
+  }
 
-  printMenu();
-  Serial.println(F("\nPress any key to start scanning..."));
-  flushSerial();
-  while (!Serial.available());
-  flushSerial();
+  configureGen2Parameters();
+
+  // Brief LED test — all on, then off
+  Serial.println(F("\nLED test..."));
+  for (int i = 0; i < NUM_PUCKS; i++) digitalWrite(pucks[i].ledPin, HIGH);
+  delay(500);
+  for (int i = 0; i < NUM_PUCKS; i++) digitalWrite(pucks[i].ledPin, LOW);
+
+  Serial.println(F("\n────────────────────────────────────────"));
+  Serial.println(F("Place pucks in beaker, then press any key to scan."));
+  Serial.println(F("────────────────────────────────────────\n"));
 }
+
+// ─── Main Loop ──────────────────────────────────────────────────────────────
 
 void loop() {
-  byte epc[12];
-  byte epcLength = sizeof(epc);
-  
-  Serial.println(F("Scanning..."));
-  uint8_t response = rfidModule.readTagEPC(epc, epcLength, 500);
-  
-  if (response == RESPONSE_SUCCESS) {
-    Serial.print(F("EPC: "));
-    for (byte i = 0; i < epcLength; i++) {
-      if (epc[i] < 0x10) Serial.print(F("0"));
-      Serial.print(epc[i], HEX);
-      Serial.print(F(" "));
-    }
-    Serial.println();
-  }
-  
-  handleSerialInput();
-}
-
-// === Gen2 Parameter Setters ===
-
-void setSession(TMR_GEN2_Session session) {
-  if (!rfidModule.setGen2Session(session)) {
-    Serial.println(F("ERROR: Failed to set Session"));
+  if (Serial.available()) {
+    flushSerialInput();
+    performScan();
   }
 }
 
-void setTarget(TMR_GEN2_Target target) {
-  if (!rfidModule.setGen2Target(target)) {
-    Serial.println(F("ERROR: Failed to set Target"));
-  }
-}
+// ─── Module Initialization ──────────────────────────────────────────────────
 
-void setRFMode(TMR_GEN2_RFMode mode) {
-  if (!rfidModule.setGen2RFmode(mode)) {
-    Serial.println(F("ERROR: Failed to set RFMode"));
-  }
-}
-
-void setQ(TMR_SR_GEN2_QType qType, uint8_t initQ = 4, bool setInit = false) {
-  if (!rfidModule.setGen2Q(qType, initQ, setInit)) {
-    Serial.println(F("ERROR: Failed to set Q"));
-  }
-}
-
-// === Serial Input Handler ===
-
-void handleSerialInput() {
-  if (!Serial.available()) return;
-  
-  char c1 = Serial.read();
-  delay(50);
-  char c2 = Serial.available() ? Serial.read() : 0;
-  flushSerial();
-
-  // Target: a, b, ab, ba
-  if (c1 == 'a' && c2 == 'b')      { Serial.println(F("Target → AB")); setTarget(TMR_GEN2_TARGET_AB); }
-  else if (c1 == 'a')              { Serial.println(F("Target → A"));  setTarget(TMR_GEN2_TARGET_A); }
-  else if (c1 == 'b' && c2 == 'a') { Serial.println(F("Target → BA")); setTarget(TMR_GEN2_TARGET_BA); }
-  else if (c1 == 'b')              { Serial.println(F("Target → B"));  setTarget(TMR_GEN2_TARGET_B); }
-  
-  // Session: s0, s1, s2, s3
-  else if (c1 == 's') {
-    switch (c2) {
-      case '0': Serial.println(F("Session → S0")); setSession(TMR_GEN2_SESSION_S0); break;
-      case '1': Serial.println(F("Session → S1")); setSession(TMR_GEN2_SESSION_S1); break;
-      case '2': Serial.println(F("Session → S2")); setSession(TMR_GEN2_SESSION_S2); break;
-      case '3': Serial.println(F("Session → S3")); setSession(TMR_GEN2_SESSION_S3); break;
-      default:  Serial.println(F("Invalid session (s0-s3)")); break;
-    }
-  }
-  
-  // Q: qd (dynamic), qs (static)
-  else if (c1 == 'q') {
-    if (c2 == 'd')      { Serial.println(F("Q → Dynamic")); setQ(TMR_SR_GEN2_Q_DYNAMIC); }
-    else if (c2 == 's') { Serial.println(F("Q → Static"));  setQ(TMR_SR_GEN2_Q_STATIC); }
-    else                { Serial.println(F("Invalid Q (qd/qs)")); }
-  }
-  
-  // RFMode: r0-r7
-  else if (c1 == 'r') {
-    TMR_GEN2_RFMode modes[] = {
-      TMR_GEN2_RFMODE_160_M8_20,   // r0
-      TMR_GEN2_RFMODE_250_M4_20,   // r1
-      TMR_GEN2_RFMODE_320_M2_15,   // r2
-      TMR_GEN2_RFMODE_320_M2_20,   // r3
-      TMR_GEN2_RFMODE_320_M4_20,   // r4
-      TMR_GEN2_RFMODE_640_FM0_7_5, // r5
-      TMR_GEN2_RFMODE_640_M2_7_5,  // r6
-      TMR_GEN2_RFMODE_640_M4_7_5   // r7
-    };
-    int idx = c2 - '0';
-    if (idx >= 0 && idx <= 7) {
-      Serial.print(F("RFMode → ")); Serial.println(idx);
-      setRFMode(modes[idx]);
-    } else {
-      Serial.println(F("Invalid RFMode (r0-r7)"));
-    }
-  }
-  
-  else if (c1 == '?') { printMenu(); }
-  
-  else { Serial.println(F("Unknown command. Press ? for help.")); }
-}
-
-void printMenu() {
-  Serial.println(F("\n=== Gen2 Parameter Commands ==="));
-  Serial.println(F("  Target:  a / b / ab / ba"));
-  Serial.println(F("  Session: s0 / s1 / s2 / s3"));
-  Serial.println(F("  Q:       qd (dynamic) / qs (static)"));
-  Serial.println(F("  RFMode:  r0-r7"));
-  Serial.println(F("  Help:    ?"));
-}
-
-void flushSerial() {
-  delay(50);
-  while (Serial.available()) { Serial.read(); delay(10); }
-}
-
-// === Module Initialization ===
-
-bool setupRfidModule() {
+bool initializeModule() {
   rfidModule.begin(Serial1, ThingMagic_M7E_HECTO);
   delay(200);
-  
-  // Clear any startup messages
-  while (Serial1.available()) Serial1.read();
-  
+
+  // Drain any startup noise from the module
+  while (Serial1.available()) { Serial1.read(); }
+
+  // Attempt communication
   rfidModule.getVersion();
-  
+
   if (rfidModule.msg[0] == ERROR_WRONG_OPCODE_RESPONSE) {
-    // Module is mid-read, stop it
-    Serial.println(F("Module was reading, stopping..."));
+    // Module was in continuous read mode from a previous session
+    Serial.println(F("  Module was mid-read, sending stop command..."));
     rfidModule.stopReading();
-    delay(1500);
-  }
-  else if (rfidModule.msg[0] != ALL_GOOD) {
-    // Try default baud rate
-    Serial1.begin(115200, SERIAL_8N1, RXD1, TXD1);
-    rfidModule.setBaud(RFID_BAUD);
-    Serial1.begin(RFID_BAUD, SERIAL_8N1, RXD1, TXD1);
+    delay(1500);  // Wait for module to fully stop
     rfidModule.getVersion();
-    if (rfidModule.msg[0] != ALL_GOOD) return false;
   }
-  
-  rfidModule.setTagProtocol();  // GEN2
-  rfidModule.setAntennaPort();  // Antenna port 1
+
+  if (rfidModule.msg[0] != ALL_GOOD) {
+    // Module might be at a different baud rate. Try the most common default.
+    Serial.println(F("  No response at 115200, trying module reset..."));
+    Serial1.begin(115200, SERIAL_8N1, RXD1, TXD1);
+    delay(100);
+    rfidModule.getVersion();
+
+    if (rfidModule.msg[0] != ALL_GOOD) {
+      return false;
+    }
+  }
+
+  // Print firmware version for diagnostics
+  Serial.print(F("  Module firmware: "));
+  for (uint8_t i = 5; i < rfidModule.msg[1] + 3; i++) {
+    if (rfidModule.msg[i] < 0x10) Serial.print('0');
+    Serial.print(rfidModule.msg[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  // Core module configuration (order matters)
+  Serial.println(F("  Configuring module..."));
+  rfidModule.setTagProtocol();        // GEN2 (0x05)
+  rfidModule.setAntennaPort();        // TX=1, RX=1
+  rfidModule.setAntennaSearchList();  // Configure antenna search list
+  rfidModule.setRegion(RFID_REGION);
+  rfidModule.setReadPower(READ_POWER);
+
+  Serial.print(F("  Read power set to "));
+  Serial.print(READ_POWER / 100);
+  Serial.print('.');
+  Serial.print(READ_POWER % 100);
+  Serial.println(F(" dBm"));
+
   return true;
+}
+
+// ─── Gen2 Parameter Configuration ───────────────────────────────────────────
+
+void configureGen2Parameters() {
+  Serial.println(F("\nConfiguring Gen2 parameters:"));
+
+  Serial.print(F("  Session S1 ......... "));
+  printResult(rfidModule.setGen2Session(TMR_GEN2_SESSION_S1));
+
+  Serial.print(F("  Target AB .......... "));
+  printResult(rfidModule.setGen2Target(TMR_GEN2_TARGET_AB));
+
+  Serial.print(F("  Q Dynamic (init=4) . "));
+  printResult(rfidModule.setGen2Q(TMR_SR_GEN2_Q_DYNAMIC, 4, true));
+
+  Serial.print(F("  RFMode 250/M4/20 ... "));
+  printResult(rfidModule.setGen2RFmode(TMR_GEN2_RFMODE_250_M4_20));
+}
+
+// ─── Multi-Tag Scan (Continuous Read Approach) ──────────────────────────────
+
+void performScan() {
+  Serial.println(F("\n>>> SCANNING <<<\n"));
+
+  // Reset tag inventory and puck detection flags
+  tagCount = 0;
+  memset(tagInventory, 0, sizeof(tagInventory));
+  for (int i = 0; i < NUM_PUCKS; i++) {
+    pucks[i].detected = false;
+  }
+
+  // Ensure LEDs are off at start of scan
+  for (int i = 0; i < NUM_PUCKS; i++) {
+    digitalWrite(pucks[i].ledPin, LOW);
+  }
+
+  // Start continuous reading — module will stream tag records over UART
+  rfidModule.startReading();
+  readerRunning = true;
+
+  uint32_t scanStart = millis();
+  uint16_t totalReads = 0;
+  uint16_t keepAlives = 0;
+  uint16_t parseErrors = 0;
+
+  // ── Collection window: poll for tags until time expires ──
+  while (millis() - scanStart < SCAN_WINDOW_MS) {
+
+    // check() reads bytes from UART and returns true when a complete
+    // message frame is assembled in rfidModule.msg[]
+    if (rfidModule.check()) {
+
+      uint8_t responseType = rfidModule.parseResponse();
+
+      switch (responseType) {
+        case RESPONSE_IS_TAGFOUND:
+          {
+            totalReads++;
+
+            // Extract EPC from the parsed message
+            uint8_t tagDataBytes = rfidModule.getTagDataBytes();
+            uint8_t epcBytes = rfidModule.getTagEPCBytes();
+            int8_t rssi = rfidModule.getTagRSSI();
+
+            // Sanity check — corrupt frames can report absurd lengths
+            if (epcBytes == 0 || epcBytes > EPC_MAX_BYTES) {
+              parseErrors++;
+              break;
+            }
+
+            // EPC data starts at byte 31 + tagDataBytes offset in msg[]
+            uint8_t epcStartIdx = 31 + tagDataBytes;
+
+            // Check if this EPC is already in our inventory
+            int existingIdx = findTagByEPC(&rfidModule.msg[epcStartIdx], epcBytes);
+
+            if (existingIdx >= 0) {
+              // Update existing tag's timestamp and RSSI
+              tagInventory[existingIdx].lastSeenMs = millis();
+              tagInventory[existingIdx].rssi = rssi;
+            } else if (tagCount < MAX_TAGS) {
+              // New unique tag — add to inventory
+              DetectedTag *tag = &tagInventory[tagCount];
+              memcpy(tag->epc, &rfidModule.msg[epcStartIdx], epcBytes);
+              tag->epcLen = epcBytes;
+              tag->rssi = rssi;
+              tag->lastSeenMs = millis();
+              tagCount++;
+
+              // Print immediately for real-time feedback
+              Serial.print(F("  [NEW] Tag #"));
+              Serial.print(tagCount);
+              Serial.print(F(" | RSSI: "));
+              Serial.print(rssi);
+              Serial.print(F(" dBm | EPC: "));
+              printEPC(tag->epc, tag->epcLen);
+            }
+            break;
+          }
+
+        case RESPONSE_IS_KEEPALIVE:
+          keepAlives++;
+          break;
+
+        case RESPONSE_IS_TEMPERATURE:
+          break;
+
+        case RESPONSE_IS_TEMPTHROTTLE:
+          Serial.println(F("  WARNING: Module is thermal throttling!"));
+          break;
+
+        case ERROR_CORRUPT_RESPONSE:
+          parseErrors++;
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    // Yield to ESP32 watchdog
+    // yield();
+  }
+
+  // ── Stop continuous reading ──
+  rfidModule.stopReading();
+  readerRunning = false;
+  delay(100);
+
+  // Drain any remaining bytes from the UART buffer
+  while (Serial1.available()) { Serial1.read(); }
+
+  // ── Match detected tags against known pucks ──
+  int pucksFound = 0;
+  for (int i = 0; i < tagCount; i++) {
+    for (int p = 0; p < NUM_PUCKS; p++) {
+      if (!pucks[p].detected && tagInventory[i].epcLen == EPC_LENGTH && memcmp(tagInventory[i].epc, pucks[p].epc, EPC_LENGTH) == 0) {
+        pucks[p].detected = true;
+        pucksFound++;
+      }
+    }
+  }
+
+  // ── Print Results ──
+  Serial.println(F("\n────────────────────────────────────────"));
+  Serial.print(F("SCAN COMPLETE: "));
+  Serial.print(tagCount);
+  Serial.print(F(" unique tag(s) found in "));
+  Serial.print(SCAN_WINDOW_MS);
+  Serial.println(F(" ms"));
+  Serial.print(F("  Total tag reads: "));
+  Serial.println(totalReads);
+  Serial.print(F("  Keep-alives:     "));
+  Serial.println(keepAlives);
+  if (parseErrors > 0) {
+    Serial.print(F("  Parse errors:    "));
+    Serial.println(parseErrors);
+  }
+  Serial.print(F("  Known pucks:     "));
+  Serial.print(pucksFound);
+  Serial.print(F("/"));
+  Serial.println(NUM_PUCKS);
+  Serial.println(F("────────────────────────────────────────"));
+
+  if (tagCount > 0) {
+    Serial.println(F("\nAll Detected Tags:"));
+    for (int i = 0; i < tagCount; i++) {
+      Serial.print(F("  #"));
+      Serial.print(i + 1);
+      Serial.print(F(" | RSSI: "));
+      char rssiBuf[8];
+      snprintf(rssiBuf, sizeof(rssiBuf), "%4d", tagInventory[i].rssi);
+      Serial.print(rssiBuf);
+      Serial.print(F(" dBm | EPC: "));
+      printEPC(tagInventory[i].epc, tagInventory[i].epcLen);
+    }
+  } else {
+    Serial.println(F("\nNo tags detected."));
+    Serial.println(F("  → Check that pucks are within antenna range."));
+    Serial.print(F("  → Try increasing READ_POWER (currently "));
+    Serial.print(READ_POWER);
+    Serial.println(F(")."));
+  }
+
+  // ── Light LEDs for matched pucks ──
+  if (pucksFound > 0) {
+    Serial.print(F("\nLEDs ON: "));
+    for (int i = 0; i < NUM_PUCKS; i++) {
+      if (pucks[i].detected) {
+        digitalWrite(pucks[i].ledPin, HIGH);
+        Serial.print(pucks[i].name);
+        Serial.print(' ');
+      }
+    }
+    Serial.println();
+
+    delay(LED_DISPLAY_MS);
+
+    for (int i = 0; i < NUM_PUCKS; i++) {
+      digitalWrite(pucks[i].ledPin, LOW);
+    }
+    Serial.println(F("LEDs OFF."));
+  }
+
+  Serial.println(F("\nPress any key to scan again...\n"));
+}
+
+// ─── Tag Lookup ─────────────────────────────────────────────────────────────
+
+int findTagByEPC(byte *epc, uint8_t epcLen) {
+  for (int i = 0; i < tagCount; i++) {
+    if (tagInventory[i].epcLen == epcLen && memcmp(tagInventory[i].epc, epc, epcLen) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ─── Utility ────────────────────────────────────────────────────────────────
+
+void printEPC(byte *epc, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++) {
+    if (epc[i] < 0x10) Serial.print('0');
+    Serial.print(epc[i], HEX);
+    if (i < len - 1) Serial.print(' ');
+  }
+  Serial.println();
+}
+
+void printResult(bool success) {
+  Serial.println(success ? F("OK") : F("FAILED"));
+}
+
+void flushSerialInput() {
+  delay(50);
+  while (Serial.available()) {
+    Serial.read();
+    delay(5);
+  }
 }
