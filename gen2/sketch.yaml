@@ -1,0 +1,2 @@
+default_fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi
+default_port: /dev/cu.usbmodem113101
