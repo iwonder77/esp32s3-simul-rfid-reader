@@ -1,6 +1,6 @@
 # EPC Gen2 Inventory Parameters — A Practical Guide
 
-**Context**: This guide explains the Gen2 protocol parameters that control how a UHF RFID reader finds and communicates with multiple tags. It's written for the SparkFun Simultaneous RFID Tag Reader (M6E Nano / M7E Hecto) using paulvha's extended library, but the Gen2 concepts are universal to all compliant readers and tags.
+**Context**: This guide explains the Gen2 protocol parameters that control how a UHF RFID reader finds and communicates with multiple tags. It's written for the SparkFun Simultaneous RFID Tag Reader (M6E Nano / M7E Hecto) using paulvha's [extended library](https://github.com/paulvha/ThingMagic/tree/master/Arduino_lib_special), but the following Gen2 concepts are universal to all compliant readers and tags.
 
 ---
 
