@@ -1,7 +1,7 @@
 /**
  * Interactive: building up to Beaker Interactive
  * File: gen2.ino
- * Description: multi-tag simultaneous read on keyboard "enter" key press
+ * Description: multi-tag simultaneous read on button press
  *
  * Author: Isai Sanchez (library written by paulvha)
  * Date: 2-8-26
@@ -12,7 +12,7 @@
  *   -- Target AB    → inventory A until exhausted, then B, then repeat
  *   -- Dynamic Q=2  → starts with 4 slots, auto-adjusts for population
  * - Approach:
- *   -- On keyboard press → open a collection window → accumulate unique EPCs
+ *   -- On button press → open a collection window → accumulate unique EPCs
  *    via check()/parseResponse() → match against known puck EPCs → light LEDs.
  * - Uncompatibility:
  *   -- readTagEPC()/readData() uses an 8-byte command format that may be 
@@ -33,12 +33,18 @@
 #define RFID_REGION REGION_NORTHAMERICA
 
 constexpr uint32_t RFID_BAUD = 115200;
-constexpr uint8_t RXD1 = 18;  // ESP32-S3 RX ← M7E
-constexpr uint8_t TXD1 = 17;  // ESP32-S3 TX → M7E RX
+constexpr uint8_t RXD1 = 18;  // ESP32-S3 RX ← M7E TXO
+constexpr uint8_t TXD1 = 17;  // ESP32-S3 TX → M7E RXI
 constexpr uint8_t PIN_LED_YELLOW = 1;
 constexpr uint8_t PIN_LED_BLUE = 2;
 constexpr uint8_t PIN_LED_GREEN = 3;
 constexpr uint8_t PIN_LED_RED = 15;
+constexpr uint8_t BUTTON_PIN = 48;
+const uint32_t BUTTON_DEBOUNCE_MS = 250;
+
+// ----- INTERRUPT VARs -----
+volatile bool pressed = false;
+volatile unsigned long lastPressTime = 0;
 
 // ===== RFID SCAN CONFIG =====
 constexpr uint8_t MAX_TAGS = 10;           // Maximum unique tags to track
@@ -91,6 +97,15 @@ int tagCount = 0;
 bool readerRunning = false;
 
 RFID rfidModule;
+
+// ─── Interrupt Service Routine ──────────────────────────────────────────────────
+void IRAM_ATTR buttonISR() {
+  unsigned long now = millis();
+  if (now - lastPressTime > BUTTON_DEBOUNCE_MS) {
+    pressed = true;
+    lastPressTime = now;
+  }
+}
 
 // ─── Module Initialization ──────────────────────────────────────────────────
 bool initializeModule() {
@@ -315,7 +330,7 @@ void performScan() {
     Serial.println(F("LEDs OFF."));
   }
 
-  Serial.println(F("\nPress any key to scan again...\n"));
+  Serial.println(F("\nPress button to scan again...\n"));
 }
 
 // ─── Tag Lookup ─────────────────────────────────────────────────────────────
@@ -342,14 +357,6 @@ void printResult(bool success) {
   Serial.println(success ? F("OK") : F("FAILED"));
 }
 
-void flushSerialInput() {
-  delay(50);
-  while (Serial.available()) {
-    Serial.read();
-    delay(5);
-  }
-}
-
 // Checks if an EPC matches any known puck
 int matchPuck(byte *epc, uint8_t epcLen) {
   if (epcLen != EPC_LENGTH) return -1;
@@ -373,11 +380,15 @@ void setup() {
   Serial.println(F("  Multi-Tag Scan — Continuous Read Mode"));
   Serial.println(F("========================================\n"));
 
-  // Configure LED pins
+  // Configure LED and Button pins
   for (int i = 0; i < NUM_PUCKS; i++) {
     pinMode(pucks[i].ledPin, OUTPUT);
     digitalWrite(pucks[i].ledPin, LOW);
   }
+  delay(10);
+  pinMode(BUTTON_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+
 
   // Initialize UART to M7E with explicit ESP32-S3 pin mapping
   Serial1.begin(RFID_BAUD, SERIAL_8N1, RXD1, TXD1);
@@ -396,13 +407,15 @@ void setup() {
   for (int i = 0; i < NUM_PUCKS; i++) digitalWrite(pucks[i].ledPin, LOW);
 
   Serial.println(F("\n────────────────────────────────────────"));
-  Serial.println(F("Place pucks in beaker, then press any key to scan."));
+  Serial.println(F("Place pucks in beaker, then press button to scan."));
   Serial.println(F("────────────────────────────────────────\n"));
 }
 
 void loop() {
-  if (Serial.available()) {
-    flushSerialInput();
+  if (pressed) {
+    Serial.println("\nButton pressed!");
+    delay(10);
+    pressed = false;
     performScan();
   }
 }
